@@ -11,6 +11,9 @@ GCJ-02（火星坐标），所以走高德前会先把坐标 WGS-84→GCJ-02 转
 所以本插件多数时候静默、只有真读到 GPS 才回复。MaiBot 自身不剥 EXIF（原样存盘）。
 
 通过 chat.receive.before_process 钩子在最早阶段拿原始字节，不改动 MaiBot 核心源码。
+
+会话白名单：whitelist_enabled 开启后，只处理 whitelist_chats 里登记的会话
+（群聊按群号、私聊按对方QQ号，可混合），白名单外的消息一律静默忽略。
 """
 
 from __future__ import annotations
@@ -103,6 +106,14 @@ class BasicSection(PluginConfigBase):
     group_only: bool = Field(
         default=True, description="只在群聊生效。",
         json_schema_extra={"label": "仅群聊生效"})
+    whitelist_enabled: bool = Field(
+        default=False,
+        description="启用会话白名单：开启后只在下方列表内的会话生效（群聊按群号、私聊按对方QQ号判断）。",
+        json_schema_extra={"label": "启用白名单"})
+    whitelist_chats: list[str] = Field(
+        default_factory=list,
+        description="白名单会话列表：群聊填群号，私聊填QQ号，可混合。启用白名单且列表为空时插件保持静默。",
+        json_schema_extra={"label": "白名单(群号/QQ号)"})
     scan_files: bool = Field(
         default=True, description="除了内联图片，也尝试读取以“文件”形式发送的图片（GPS 存活率更高）。",
         json_schema_extra={"label": "也读文件形式的图"})
@@ -147,6 +158,12 @@ class PhotoGeoPlugin(MaiBotPlugin):
             headers={"User-Agent": "maibot-photo-geo/1.0 (QQ group bot)"},
             follow_redirects=True)
         self.ctx.logger.info("[照片定位] 插件已加载，地理编码=%s", self.config.plugin.geocoder)
+        if self.config.plugin.whitelist_enabled:
+            wl = ",".join(str(x) for x in (self.config.plugin.whitelist_chats or []))
+            self.ctx.logger.info("[照片定位] 白名单已启用，生效会话=%s",
+                                 wl or "(空列表=全部静默)")
+        else:
+            self.ctx.logger.info("[照片定位] 白名单未启用，所有会话均生效")
 
     async def on_unload(self) -> None:
         for t in list(self._tasks):
@@ -367,6 +384,13 @@ class PhotoGeoPlugin(MaiBotPlugin):
             uinfo = info.get("user_info") if isinstance(info.get("user_info"), dict) else {}
             uid = str(uinfo.get("user_id") or "").strip()
             nick = str(uinfo.get("user_cardname") or uinfo.get("user_nickname") or "").strip()
+
+            # 会话白名单：启用后只处理列表内的会话（群聊按群号，私聊按对方QQ号）
+            if cfg.whitelist_enabled:
+                wl = {str(x).strip() for x in (cfg.whitelist_chats or []) if str(x).strip()}
+                if not wl or (gid or uid) not in wl:
+                    return None
+
             stream_id = str(message.get("session_id") or "").strip()
             if not stream_id:
                 return None
