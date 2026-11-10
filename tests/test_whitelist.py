@@ -83,16 +83,27 @@ def make_plugin(**overrides):
     return p
 
 
-def make_message(gid=GID, uid=UID, group=True, with_group_id=True, with_user_id=True):
-    info = {"user_info": {"user_id": uid if with_user_id else "",
-                          "user_nickname": "测试群友"}}
-    if group:
+def make_message(gid=GID, uid=UID, group=True, with_group_id=True, with_user_id=True,
+                 platform="qq", napcat_type=None, group_info_present=None):
+    # napcat_type 缺省随 group；group_info_present 缺省随 group。
+    # 复现「缺群号的群消息」：napcat_type="group" 但 group_info_present=False。
+    if napcat_type is None:
+        napcat_type = "group" if group else "private"
+    if group_info_present is None:
+        group_info_present = group
+    info = {
+        "user_info": {"user_id": uid if with_user_id else "",
+                      "user_nickname": "测试群友"},
+        "additional_config": {"self_id": "10001", "napcat_message_type": napcat_type},
+    }
+    if group_info_present:
         info["group_info"] = {"group_id": gid if with_group_id else "",
                               "group_name": "测试群"}
     else:
         info["group_info"] = None
     return {
         "session_id": "stream-1",
+        "platform": platform,
         "raw_message": [{"type": "image",
                          "binary_data_base64": IMG, "hash": "testhash"}],
         "message_info": info,
@@ -238,6 +249,56 @@ class WhitelistHookTest(unittest.IsolatedAsyncioTestCase):
                              whitelist_chats=["private:" + UID])
         await self.assert_rejected_before_processing(
             make_message(group=False, with_user_id=False))
+
+    # ---- review① 缺群号的群消息（group_info 被省略、napcat_message_type=group）----
+    async def test_group_marked_but_gid_missing_not_treated_as_private(self):
+        # 维护者复现场景：group_only=false、发图人在私聊白名单里，消息明确标记为群
+        # 但省略了 group_info —— 必须跳过，不能落入私聊分支误放行
+        self.p = make_plugin(whitelist_enabled=True, group_only=False,
+                             whitelist_chats=["private:" + UID])
+        await self.assert_rejected_before_processing(
+            make_message(napcat_type="group", group_info_present=False))
+
+    async def test_group_marked_gid_missing_skips_even_if_group_listed(self):
+        self.p = make_plugin(whitelist_enabled=True, group_only=False,
+                             whitelist_chats=["group:" + GID])
+        await self.assert_rejected_before_processing(
+            make_message(napcat_type="group", group_info_present=False))
+
+    # ---- review② 跨平台同号（白名单仅对 QQ 平台生效）----
+    async def test_telegram_private_same_number_not_matched(self):
+        self.p = make_plugin(whitelist_enabled=True, group_only=False,
+                             whitelist_chats=["private:" + UID])
+        await self.assert_rejected_before_processing(
+            make_message(group=False, platform="telegram"))
+
+    async def test_telegram_group_same_number_not_matched(self):
+        self.p = make_plugin(whitelist_enabled=True, group_only=False,
+                             whitelist_chats=["group:" + GID])
+        await self.assert_rejected_before_processing(make_message(platform="telegram"))
+
+    async def test_qq_platform_still_matches(self):
+        self.p = make_plugin(whitelist_enabled=True, group_only=False,
+                             whitelist_chats=["private:" + UID])
+        await self.assert_processed(make_message(group=False, platform="qq"))
+
+    # ---- review③ 配置校验脱敏（未加引号的整数条目不得泄露原值）----
+    async def test_integer_entries_do_not_leak_value(self):
+        self.p = make_plugin(whitelist_enabled=True)
+        if hasattr(self.p, "set_plugin_config"):
+            # 真 SDK：直接注入未加引号的整数，复现热更新校验链路
+            self.p.set_plugin_config({"plugin": {"config_version": "1.0.0",
+                                                 "whitelist_enabled": True,
+                                                 "whitelist_chats": [123456789]}})
+        else:
+            # 桩：构造模型同样经过 before 校验器
+            set_config(self.p, plugin.GeoConfig(plugin=plugin.BasicSection(
+                whitelist_enabled=True, whitelist_chats=[123456789])))
+        entries = self.p.config.plugin.whitelist_chats
+        self.assertEqual(entries, ["123456789"])
+        self.assertEqual(plugin._whitelist_tokens(entries), set())
+        self.p._log_whitelist_status()
+        self.assertNotIn("123456789", rendered_logs(self.p.ctx.logger))
 
     # ---- 日志脱敏 ----
     async def test_log_contains_no_ids(self):
