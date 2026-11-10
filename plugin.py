@@ -12,8 +12,9 @@ GCJ-02（火星坐标），所以走高德前会先把坐标 WGS-84→GCJ-02 转
 
 通过 chat.receive.before_process 钩子在最早阶段拿原始字节，不改动 MaiBot 核心源码。
 
-会话白名单：whitelist_enabled 开启后，只处理 whitelist_chats 里登记的会话
-（群聊按群号、私聊按对方QQ号，可混合），白名单外的消息一律静默忽略。
+会话白名单：whitelist_enabled 开启后，只处理 whitelist_chats 里登记的会话。
+条目格式为 group:<群号> / private:<QQ号>（群聊只认群号、私聊只认对方QQ号，
+两类条目互不混用），白名单外的消息一律静默忽略；开启但无有效条目时全部静默。
 """
 
 from __future__ import annotations
@@ -37,6 +38,25 @@ PLUGIN_VERSION = "1.0.0"
 
 _GPS_IFD = 34853  # EXIF GPSInfo IFD tag
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".tif", ".tiff")
+
+
+# ----------------------------- 会话白名单 -----------------------------
+def _whitelist_tokens(entries: Optional[list]) -> set[str]:
+    """把配置条目归一化成 {"group:<群号>", "private:<QQ号>"} 集合。
+
+    只认带前缀且号码为纯数字的条目；裸号码、未知前缀、空号码一律视为无效，
+    避免群号与 QQ 号同号时误放行。
+    """
+    tokens: set[str] = set()
+    for item in entries or []:
+        s = str(item).strip()
+        for prefix in ("group:", "private:"):
+            if s.startswith(prefix):
+                num = s[len(prefix):].strip()
+                if num.isdigit():
+                    tokens.add(prefix + num)
+                break
+    return tokens
 
 
 # ----------------------------- WGS-84 -> GCJ-02（高德用） -----------------------------
@@ -108,12 +128,12 @@ class BasicSection(PluginConfigBase):
         json_schema_extra={"label": "仅群聊生效"})
     whitelist_enabled: bool = Field(
         default=False,
-        description="启用会话白名单：开启后只在下方列表内的会话生效（群聊按群号、私聊按对方QQ号判断）。",
+        description="启用会话白名单：开启后只处理下方列表内登记的会话（条目格式 group:<群号> / private:<QQ号）。开启但无有效条目时插件保持静默。",
         json_schema_extra={"label": "启用白名单"})
     whitelist_chats: list[str] = Field(
         default_factory=list,
-        description="白名单会话列表：群聊填群号，私聊填QQ号，可混合。启用白名单且列表为空时插件保持静默。",
-        json_schema_extra={"label": "白名单(群号/QQ号)"})
+        description='白名单会话列表，条目格式 "group:<群号>" 或 "private:<QQ号>"，如 group:123456789、private:987654321。群聊只认 group: 条目，私聊只认 private: 条目（私聊还需 group_only=false）。裸号码等无效条目会被忽略。',
+        json_schema_extra={"label": "白名单(group:/private:)"})
     scan_files: bool = Field(
         default=True, description="除了内联图片，也尝试读取以“文件”形式发送的图片（GPS 存活率更高）。",
         json_schema_extra={"label": "也读文件形式的图"})
@@ -158,12 +178,7 @@ class PhotoGeoPlugin(MaiBotPlugin):
             headers={"User-Agent": "maibot-photo-geo/1.0 (QQ group bot)"},
             follow_redirects=True)
         self.ctx.logger.info("[照片定位] 插件已加载，地理编码=%s", self.config.plugin.geocoder)
-        if self.config.plugin.whitelist_enabled:
-            wl = ",".join(str(x) for x in (self.config.plugin.whitelist_chats or []))
-            self.ctx.logger.info("[照片定位] 白名单已启用，生效会话=%s",
-                                 wl or "(空列表=全部静默)")
-        else:
-            self.ctx.logger.info("[照片定位] 白名单未启用，所有会话均生效")
+        self._log_whitelist_status()
 
     async def on_unload(self) -> None:
         for t in list(self._tasks):
@@ -185,6 +200,19 @@ class PhotoGeoPlugin(MaiBotPlugin):
             except Exception:
                 pass
         self.ctx.logger.info("[照片定位] 配置已更新（%s）", scope)
+        self._log_whitelist_status()
+
+    def _log_whitelist_status(self) -> None:
+        # 只记录开关状态与有效条目数，不输出群号/QQ号/会话ID
+        cfg = self.config.plugin
+        if not cfg.whitelist_enabled:
+            self.ctx.logger.info("[照片定位] 白名单未启用")
+            return
+        count = len(_whitelist_tokens(cfg.whitelist_chats))
+        if count:
+            self.ctx.logger.info("[照片定位] 白名单已启用，有效条目=%d", count)
+        else:
+            self.ctx.logger.warning("[照片定位] 白名单已启用但无有效条目，所有会话将被跳过")
 
     def _track(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
@@ -385,10 +413,14 @@ class PhotoGeoPlugin(MaiBotPlugin):
             uid = str(uinfo.get("user_id") or "").strip()
             nick = str(uinfo.get("user_cardname") or uinfo.get("user_nickname") or "").strip()
 
-            # 会话白名单：启用后只处理列表内的会话（群聊按群号，私聊按对方QQ号）
+            # 会话白名单：群聊只认 group:<群号>（群号缺失即跳过），私聊只认 private:<QQ号>
+            # （group_only=true 时私聊在上面已被拦截；空/全无效名单在此一律静默）
             if cfg.whitelist_enabled:
-                wl = {str(x).strip() for x in (cfg.whitelist_chats or []) if str(x).strip()}
-                if not wl or (gid or uid) not in wl:
+                wl = _whitelist_tokens(cfg.whitelist_chats)
+                if isinstance(ginfo, dict):
+                    if not gid or ("group:" + gid) not in wl:
+                        return None
+                elif not uid or ("private:" + uid) not in wl:
                     return None
 
             stream_id = str(message.get("session_id") or "").strip()

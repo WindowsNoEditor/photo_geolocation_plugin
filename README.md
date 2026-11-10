@@ -66,7 +66,9 @@ pip install "httpx>=0.24.0" "Pillow>=9.0.0"
 | `amap_township_only` | `true` | 高德地址只显示到「市+区+街道」，不暴露具体小区/门牌 |
 | `reply_template` | `请问是在 {address} 的 {nick} 群友吗？` | 回复模板，`{address}`=地址，`{nick}`=发图人昵称 |
 | `at_user` | `true` | 回复时先 @ 一下发图的群友 |
-| `group_only` | `true` | 只在群聊生效 |
+| `group_only` | `true` | 只在群聊生效；设为 `false` 后私聊才可能生效（还需白名单里有对应 `private:` 条目，若开了白名单） |
+| `whitelist_enabled` | `false` | 启用会话白名单：开启后只处理 `whitelist_chats` 里登记的会话；开启但无有效条目时全部静默 |
+| `whitelist_chats` | `[]` | 白名单条目，格式 `group:<群号>` / `private:<QQ号>`，如 `["group:123456789", "private:987654321"]` |
 | `scan_files` | `true` | 除内联图片外，也尝试读取以「文件」形式发送的图片 |
 | `cooldown_seconds` | `20` | 同一个人两次定位回复的最小间隔（秒），防刷屏 |
 | `address_max_len` | `60` | 地址最长显示字数，`0` 表示不截断 |
@@ -76,6 +78,45 @@ pip install "httpx>=0.24.0" "Pillow>=9.0.0"
 
 > 高德 Key 申请：高德开放平台 console.amap.com → 应用 → 添加 Key → 服务平台选 **「Web服务」**
 > （不是 JS/Android/iOS/小程序）。个人免费额度日常够用。
+
+## 会话白名单
+
+bot 同时挂在多个群/私聊时，可以只在指定会话里生效。默认**关闭**
+（`whitelist_enabled = false`、`whitelist_chats = []`），老配置升级后行为不变，
+仍按 `group_only` 等原有设置工作。
+
+条目必须带前缀，**群号与 QQ 号分开登记**（以下号码均为虚构示例）：
+
+- `group:<群号>` —— 群聊条目，群消息只按群号匹配；
+- `private:<QQ号>` —— 私聊条目，私聊只按对方 QQ 号匹配。
+
+**仅群聊生效**（默认 `group_only = true` 即可）：
+
+```toml
+[plugin]
+group_only = true
+whitelist_enabled = true
+whitelist_chats = ["group:123456789", "group:987654321"]
+```
+
+**允许指定私聊**（必须显式 `group_only = false`，否则私聊一律不生效）：
+
+```toml
+[plugin]
+group_only = false
+whitelist_enabled = true
+whitelist_chats = ["group:123456789", "private:11112222"]
+```
+
+行为约定：
+
+- **开启白名单但列表为空（或全是无效条目）= 所有会话静默**。宁可「配漏了不工作」，
+  也不做「以为限制了其实没限」；加载/配置更新时会提示一次「无有效条目」。
+- 裸号码（如 `"123456789"`）、未知前缀、非数字号码都算**无效条目**，会被忽略。
+- 群号与 QQ 号即使数字相同也互不误放行：`group:123` 只匹配群 123，
+  `private:123` 只匹配 QQ 号 123 的私聊。
+- 群消息缺失群号、私聊缺失对方 QQ 号时直接跳过。
+- 日志只记录白名单开关状态与有效条目数，不输出群号/QQ 号/会话 ID。
 
 ## 使用
 
