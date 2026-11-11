@@ -11,6 +11,11 @@ GCJ-02（火星坐标），所以走高德前会先把坐标 WGS-84→GCJ-02 转
 所以本插件多数时候静默、只有真读到 GPS 才回复。MaiBot 自身不剥 EXIF（原样存盘）。
 
 通过 chat.receive.before_process 钩子在最早阶段拿原始字节，不改动 MaiBot 核心源码。
+
+会话白名单：whitelist_enabled 开启后，只处理 whitelist_chats 里登记的会话。
+条目格式为 group:<群号> / private:<QQ号>，仅对 QQ 平台生效（群聊只认群号、
+私聊只认对方QQ号，两类条目互不混用），白名单外的消息一律静默忽略；
+开启但无有效条目时全部静默。
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from time import monotonic
 from typing import Any, Optional
 
 import httpx
+from pydantic import field_validator
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -34,6 +40,25 @@ PLUGIN_VERSION = "1.0.0"
 
 _GPS_IFD = 34853  # EXIF GPSInfo IFD tag
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".tif", ".tiff")
+
+
+# ----------------------------- 会话白名单 -----------------------------
+def _whitelist_tokens(entries: Optional[list]) -> set[str]:
+    """把配置条目归一化成 {"group:<群号>", "private:<QQ号>"} 集合。
+
+    只认带前缀且号码为纯数字的条目；裸号码、未知前缀、空号码一律视为无效，
+    避免群号与 QQ 号同号时误放行。
+    """
+    tokens: set[str] = set()
+    for item in entries or []:
+        s = str(item).strip()
+        for prefix in ("group:", "private:"):
+            if s.startswith(prefix):
+                num = s[len(prefix):].strip()
+                if num.isdigit():
+                    tokens.add(prefix + num)
+                break
+    return tokens
 
 
 # ----------------------------- WGS-84 -> GCJ-02（高德用） -----------------------------
@@ -103,6 +128,14 @@ class BasicSection(PluginConfigBase):
     group_only: bool = Field(
         default=True, description="只在群聊生效。",
         json_schema_extra={"label": "仅群聊生效"})
+    whitelist_enabled: bool = Field(
+        default=False,
+        description="启用会话白名单：开启后只处理下方列表内登记的会话（条目格式 group:<群号> / private:<QQ号），仅对 QQ 平台生效。开启但无有效条目时插件保持静默。",
+        json_schema_extra={"label": "启用白名单"})
+    whitelist_chats: list[str] = Field(
+        default_factory=list,
+        description='白名单会话列表，条目格式 "group:<群号>" 或 "private:<QQ号>"，如 group:123456789、private:987654321。仅对 QQ 平台生效；群聊只认 group: 条目，私聊只认 private: 条目（私聊还需 group_only=false）。裸号码等无效条目会被忽略。',
+        json_schema_extra={"label": "白名单(group:/private:)"})
     scan_files: bool = Field(
         default=True, description="除了内联图片，也尝试读取以“文件”形式发送的图片（GPS 存活率更高）。",
         json_schema_extra={"label": "也读文件形式的图"})
@@ -124,6 +157,16 @@ class BasicSection(PluginConfigBase):
         default="/MaiMBot/data/images",
         description="收到的图片文件目录（按 hash 兜底读取）。一般无需修改。",
         json_schema_extra={"label": "图片目录"})
+
+    @field_validator("whitelist_chats", mode="before")
+    @classmethod
+    def _stringify_whitelist_entries(cls, value):
+        # 误写成未加引号的整数时先转字符串：pydantic 的任何 ValidationError 都会附 input_value，
+        # 而 SDK/宿主热更新会把 str(exc) 写进日志导致号码泄露。转字符串后裸号码按无效条目忽略，
+        # 开启白名单时由「无有效条目」的脱敏提示反馈，绝不产生带原值的异常。
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        return value
 
 
 class GeoConfig(PluginConfigBase):
@@ -147,6 +190,7 @@ class PhotoGeoPlugin(MaiBotPlugin):
             headers={"User-Agent": "maibot-photo-geo/1.0 (QQ group bot)"},
             follow_redirects=True)
         self.ctx.logger.info("[照片定位] 插件已加载，地理编码=%s", self.config.plugin.geocoder)
+        self._log_whitelist_status()
 
     async def on_unload(self) -> None:
         for t in list(self._tasks):
@@ -168,6 +212,19 @@ class PhotoGeoPlugin(MaiBotPlugin):
             except Exception:
                 pass
         self.ctx.logger.info("[照片定位] 配置已更新（%s）", scope)
+        self._log_whitelist_status()
+
+    def _log_whitelist_status(self) -> None:
+        # 只记录开关状态与有效条目数，不输出群号/QQ号/会话ID
+        cfg = self.config.plugin
+        if not cfg.whitelist_enabled:
+            self.ctx.logger.info("[照片定位] 白名单未启用")
+            return
+        count = len(_whitelist_tokens(cfg.whitelist_chats))
+        if count:
+            self.ctx.logger.info("[照片定位] 白名单已启用，有效条目=%d", count)
+        else:
+            self.ctx.logger.warning("[照片定位] 白名单已启用但无有效条目，所有会话将被跳过")
 
     def _track(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
@@ -367,6 +424,23 @@ class PhotoGeoPlugin(MaiBotPlugin):
             uinfo = info.get("user_info") if isinstance(info.get("user_info"), dict) else {}
             uid = str(uinfo.get("user_id") or "").strip()
             nick = str(uinfo.get("user_cardname") or uinfo.get("user_nickname") or "").strip()
+
+            # 会话白名单：仅对 QQ 平台生效（条目是 QQ 号语义，Telegram 等其它平台同号也不放行）；
+            # 群聊只认 group:<群号>，私聊只认 private:<QQ号>。群聊判定兼看 napcat_message_type：
+            # NapCat/SnowLuma 缺群号时会省略 group_info 但保留该标记，此类消息缺群号必须跳过，
+            # 不能落入私聊分支误放行。（group_only=true 时私聊在上面已被拦截；空/全无效名单一律静默）
+            if cfg.whitelist_enabled:
+                if str(message.get("platform") or "").strip() != "qq":
+                    return None
+                acfg = info.get("additional_config") if isinstance(info.get("additional_config"), dict) else {}
+                is_group = isinstance(ginfo, dict) or str(acfg.get("napcat_message_type") or "").strip() == "group"
+                wl = _whitelist_tokens(cfg.whitelist_chats)
+                if is_group:
+                    if not gid or ("group:" + gid) not in wl:
+                        return None
+                elif not uid or ("private:" + uid) not in wl:
+                    return None
+
             stream_id = str(message.get("session_id") or "").strip()
             if not stream_id:
                 return None

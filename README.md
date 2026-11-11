@@ -66,7 +66,9 @@ pip install "httpx>=0.24.0" "Pillow>=9.0.0"
 | `amap_township_only` | `true` | 高德地址只显示到「市+区+街道」，不暴露具体小区/门牌 |
 | `reply_template` | `请问是在 {address} 的 {nick} 群友吗？` | 回复模板，`{address}`=地址，`{nick}`=发图人昵称 |
 | `at_user` | `true` | 回复时先 @ 一下发图的群友 |
-| `group_only` | `true` | 只在群聊生效 |
+| `group_only` | `true` | 只在群聊生效；设为 `false` 后私聊才可能生效（还需白名单里有对应 `private:` 条目，若开了白名单） |
+| `whitelist_enabled` | `false` | 启用会话白名单：开启后只处理 `whitelist_chats` 里登记的会话；开启但无有效条目时全部静默 |
+| `whitelist_chats` | `[]` | 白名单条目，格式 `group:<群号>` / `private:<QQ号>`，如 `["group:123456789", "private:987654321"]` |
 | `scan_files` | `true` | 除内联图片外，也尝试读取以「文件」形式发送的图片 |
 | `cooldown_seconds` | `20` | 同一个人两次定位回复的最小间隔（秒），防刷屏 |
 | `address_max_len` | `60` | 地址最长显示字数，`0` 表示不截断 |
@@ -77,6 +79,52 @@ pip install "httpx>=0.24.0" "Pillow>=9.0.0"
 > 高德 Key 申请：高德开放平台 console.amap.com → 应用 → 添加 Key → 服务平台选 **「Web服务」**
 > （不是 JS/Android/iOS/小程序）。个人免费额度日常够用。
 
+## 会话白名单
+
+bot 同时挂在多个群/私聊时，可以只在指定会话里生效。默认**关闭**
+（`whitelist_enabled = false`、`whitelist_chats = []`），老配置升级后行为不变，
+仍按 `group_only` 等原有设置工作。
+
+白名单条目是 QQ 号语义，**仅对 QQ 平台生效**：同一 MaiBot 实例若还接了 Telegram
+等其它平台，即使私聊 ID 数字相同也不会误放行（开启白名单时其它平台的消息一律跳过）。
+
+条目必须带前缀，**群号与 QQ 号分开登记**（以下号码均为虚构示例）：
+
+- `group:<群号>` —— 群聊条目，群消息只按群号匹配；
+- `private:<QQ号>` —— 私聊条目，私聊只按对方 QQ 号匹配。
+
+**仅群聊生效**（默认 `group_only = true` 即可）：
+
+```toml
+[plugin]
+group_only = true
+whitelist_enabled = true
+whitelist_chats = ["group:123456789", "group:987654321"]
+```
+
+**允许指定私聊**（必须显式 `group_only = false`，否则私聊一律不生效）：
+
+```toml
+[plugin]
+group_only = false
+whitelist_enabled = true
+whitelist_chats = ["group:123456789", "private:11112222"]
+```
+
+行为约定：
+
+- **开启白名单但列表为空（或全是无效条目）= 所有会话静默**。宁可「配漏了不工作」，
+  也不做「以为限制了其实没限」；加载/配置更新时会提示一次「无有效条目」。
+- 裸号码（如 `"123456789"`）、未知前缀、非数字号码都算**无效条目**，会被忽略。
+- 群号与 QQ 号即使数字相同也互不误放行：`group:123` 只匹配群 123，
+  `private:123` 只匹配 QQ 号 123 的私聊。
+- 群消息缺失群号、私聊缺失对方 QQ 号时直接跳过。NapCat/SnowLuma 缺群号时可能省略
+  `group_info` 但保留群聊标记（`napcat_message_type=group`），这类消息仍按群聊处理、缺群号即跳过，
+  不会落入私聊分支误放行。
+- 条目误写成未加引号的整数（如 `whitelist_chats = [123456789]`）会被自动转成字符串、
+  按裸号码无效条目忽略，**不会抛出携带原值的校验异常**（避免热更新日志泄露号码）。
+- 日志只记录白名单开关状态与有效条目数，不输出群号/QQ 号/会话 ID。
+
 ## 使用
 
 装好后无需任何命令：群友发**带 GPS 的原图/文件**时，插件会自动 @ 对方并报出识别到的大致位置。
@@ -84,7 +132,9 @@ pip install "httpx>=0.24.0" "Pillow>=9.0.0"
 
 ## 隐私与合规说明
 
-- 本插件**只读取用户主动发到群里的图片**自带的 EXIF GPS，不访问任何其它数据；读不到 GPS 就静默。
+- 本插件**只读取用户主动发送的图片**自带的 EXIF GPS，不访问任何其它数据；读不到 GPS 就静默。
+  默认仅处理群聊；**显式启用私聊后（`group_only=false` 且白名单登记了 `private:` 条目），
+  会处理被允许的私聊里发来的图片**，请确保对方知情。
 - 这是一个「提醒大家注意照片会泄露位置」性质的功能，请在**成员知情**的群里使用，不要用于骚扰或跟踪。
 - 默认开启「地址只到街道」的含蓄模式，避免直接暴露精确门牌。
 - 使用 OSM/Nominatim 时请遵守其
